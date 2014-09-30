@@ -7,6 +7,7 @@
 
 //NVTX Dir: C:\Program Files\NVIDIA GPU Computing Toolkit\nvToolsExt
 #include <nvToolsExt.h>
+#include <thrust\copy.h>
 
 //Initialize sizes
 const int rows = 4096;
@@ -94,31 +95,68 @@ __global__ void matrixTransposeNaive(const float* __restrict__ const a,
 {
     //HINT: Look at copyKernel above
 
-    int i = 0;                        // Compute row
-    int j = 0;                        // Compute col
+    int i = blockIdx.y * blockDim.y + threadIdx.y;  // row
+    int j = blockIdx.x * blockDim.x + threadIdx.x;  // col
 
-    int index_in =  0;        // Compute input index (i,j) from matrix A
-    int index_out = 0;        // Compute output index (j,i) in matrix B = transpose(A)
+    int index_in =  i*cols + j;        // Compute input index (i,j) from matrix A
+    int index_out = j*rows + i;        // Compute output index (j,i) in matrix B = transpose(A)
 
     // Copy data from A to B
+	b[index_out] = a[index_in];
+
 }
 
 __global__ void matrixTransposeShared(const float* __restrict__ const a,
         float* __restrict__ const b)
 {
     //Allocate appropriate shared memory
+	__shared__ float mat[BLOCK_SIZE_X][BLOCK_SIZE_Y];
 
     //Compute input and output index
-
+	 int bx = blockIdx.x * blockDim.x;  // row
+     int by = blockIdx.y * blockDim.y;  // col
+	 int i = by + threadIdx.y;  // row
+     int j = bx + threadIdx.x;  // col
+	 int ti = bx + threadIdx.y;
+	 int tj = by + threadIdx.x;
     //Copy data from input to shared memory
-
+	if(i<rows && j < cols)
+	{
+		mat[threadIdx.x][threadIdx.y] = a[i * cols + j];
+		__syncthreads();
+	}
     //Copy data from shared memory to global memory
+	if( tj < rows && ti < cols)
+	{
+		b[ti * rows + tj] = mat[threadIdx.y][threadIdx.x];
+	}
 }
 
 __global__ void matrixTransposeSharedwBC(const float* __restrict__ const a,
         float* __restrict__ const b)
 {
     //HINT: Copy code from matrixTransposeShared kernel, while solving bank conflict problem
+	    //Allocate appropriate shared memory
+	__shared__ float mat[BLOCK_SIZE_X][BLOCK_SIZE_Y + 1];
+
+    //Compute input and output index
+	 int bx = blockIdx.x * blockDim.x;  // row
+     int by = blockIdx.y * blockDim.y;  // col
+	 int i = by + threadIdx.y;  // row
+     int j = bx + threadIdx.x;  // col
+	 int ti = bx + threadIdx.y;
+	 int tj = by + threadIdx.x;
+    //Copy data from input to shared memory
+	if(i<rows && j < cols)
+	{
+		mat[threadIdx.x][threadIdx.y] = a[i * cols + j];
+		__syncthreads();
+	}
+    //Copy data from shared memory to global memory
+	if( tj < rows && ti < cols)
+	{
+		b[ti * rows + tj] = mat[threadIdx.y][threadIdx.x];
+	}
 
     //Allocate appropriate shared memory
 
@@ -132,7 +170,30 @@ __global__ void matrixTransposeSharedwBC(const float* __restrict__ const a,
 
 __global__ void matrixTransposeUnrolled(const float* __restrict__ const a,
         float* __restrict__ const b)
-{
+{	__shared__ float mat[BLOCK_SIZE_X][BLOCK_SIZE_Y + 1];
+
+    //Compute input and output index
+	 int x = blockIdx.x * TILE + threadIdx.x;  // row
+     int y = blockIdx.y * TILE + threadIdx.y;  // col
+
+    //Copy data from input to shared memory
+	 for(int k = 0; k < TILE; k+=SIDE)
+	 {
+		if(x<rows && y + TILE * k < cols)
+		{
+			mat[threadIdx.y + k][threadIdx.x] = a[(y + k) * rows + x];
+			
+		}
+	 }
+	 __syncthreads();
+    //Copy data from shared memory to global memory
+	for(int k = 0; k < TILE; k+=SIDE)
+	{
+			if( y + k < rows && x < cols)
+			{
+				b[(y + k) * cols + x] = mat[threadIdx.x][threadIdx.y + k];
+			}
+	}
     //Allocate appropriate shared memory
 
     //Compute input and output index
@@ -142,9 +203,28 @@ __global__ void matrixTransposeUnrolled(const float* __restrict__ const a,
     //Copy data from shared memory to global memory. Multiple copies per thread.
 
 }
+__host__ __device__ bool is_zero(const int x)
+ {
+	 if( x > 0)
+		 return true;
+	 else
+		 return false;
+ }
 
 int main(int argc, char *argv[])
 {
+	const int N = 6;
+    int V[N] = {3, 0, 4, 0, 1, 2};
+    int * result = new int[N];
+
+    thrust::copy_if(V, V + N, result, is_zero);
+	for(int i = 0; i < 4; i++)
+	{
+		cout << result[i] << endl;
+	}
+
+
+
     //Run Memcpy benchmarks
     nvtxRangeId_t cudaBenchmark = nvtxRangeStart("CUDA Memcpy Benchmark");
 #if defined WIN64
@@ -288,9 +368,9 @@ int main(int argc, char *argv[])
         // Calculate number of blocks along X and Y in a 2D CUDA "grid"
         // HINT: Look above for copy kernel dims computation
         DIMS dims;
-        dims.dimBlock = dim3(1, 1, 1);
-        dims.dimGrid  = dim3(1,
-                1,
+        dims.dimBlock = dim3(BLOCK_SIZE_X, BLOCK_SIZE_Y, 1);
+        dims.dimGrid  = dim3(divup(rows, BLOCK_SIZE_X),
+                divup(cols, BLOCK_SIZE_Y),
                 1
                 );
 
@@ -338,9 +418,9 @@ int main(int argc, char *argv[])
         // Calculate number of blocks along X and Y in a 2D CUDA "grid"
 
         DIMS dims;
-        dims.dimBlock = dim3(1, 1, 1);
-        dims.dimGrid  = dim3(1,
-                1,
+        dims.dimBlock = dim3(BLOCK_SIZE_X, BLOCK_SIZE_Y, 1);
+        dims.dimGrid  = dim3(divup(rows, BLOCK_SIZE_X),
+                divup(cols, BLOCK_SIZE_Y),
                 1
                 );
 
@@ -388,9 +468,9 @@ int main(int argc, char *argv[])
         // Calculate number of blocks along X and Y in a 2D CUDA "grid"
 
         DIMS dims;
-        dims.dimBlock = dim3(1, 1, 1);
-        dims.dimGrid  = dim3(1,
-                1,
+        dims.dimBlock = dim3(BLOCK_SIZE_X, BLOCK_SIZE_Y, 1);
+        dims.dimGrid  = dim3(divup(rows, BLOCK_SIZE_X),
+                divup(cols, BLOCK_SIZE_Y),
                 1
                 );
 
@@ -438,9 +518,9 @@ int main(int argc, char *argv[])
         // Calculate number of blocks along X and Y in a 2D CUDA "grid"
 
         DIMS dims;
-        dims.dimBlock = dim3(1, 1, 1);
-        dims.dimGrid  = dim3(1,
-                1,
+        dims.dimBlock = dim3(TILE, SIDE, 1);
+        dims.dimGrid  = dim3(divup(rows, TILE),
+                divup(cols, TILE),
                 1
                 );
         // start the timer
